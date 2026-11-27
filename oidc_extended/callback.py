@@ -5,6 +5,9 @@
 
 import json
 import base64
+import unicodedata
+from urllib.parse import urlsplit
+
 import requests
 import jwt
 
@@ -14,6 +17,47 @@ from frappe import _ # For translations
 
 frappe.utils.logger.set_log_level("INFO")
 #frappe.utils.logger.set_log_level("DEBUG")
+
+try:  # Frappe v16+: `state` is a single-use, server-stored token that carries redirect_to.
+    from frappe.utils.oauth import consume_oauth_state
+except ImportError:  # older Frappe: `state` is base64 JSON built by the browser-side flow.
+    consume_oauth_state = None
+
+
+def _normalise(value: str) -> str:
+    """Compare usernames the way the database does (case- and width-insensitive), so
+    look-alikes such as "ADMINISTRATOR", "administrator " or full-width letters match."""
+    return unicodedata.normalize("NFKC", value or "").casefold().strip()
+
+
+def _safe_redirect(redirect_to: str | None) -> str | None:
+    """Only same-site relative paths (audit FRP-3: `redirect_to` was an open redirect)."""
+    if not redirect_to or not isinstance(redirect_to, str):
+        return None
+    parts = urlsplit(redirect_to)
+    if parts.scheme or parts.netloc or not redirect_to.startswith("/") or redirect_to.startswith(("//", "/\\")):
+        return None
+    if "\\" in redirect_to or any(ord(c) < 0x21 or ord(c) == 0x7F for c in redirect_to):
+        return None  # browsers drop tabs/newlines, so "/\t/evil" would become "//evil"
+    return redirect_to
+
+
+def _read_state(state) -> tuple[bool, str | None]:
+    """(valid, redirect_to). On Frappe v16+ the state must be one this site issued and not yet
+    used (audit FRP-3: it was never verified, so a forged callback could log someone in)."""
+    if consume_oauth_state is not None and isinstance(state, str):
+        redirect_to = consume_oauth_state(state)
+        if redirect_to is not None:
+            return True, _safe_redirect(redirect_to)
+    try:
+        legacy = state if isinstance(state, dict) else json.loads(base64.b64decode(state).decode("utf-8"))
+    except Exception:
+        return False, None
+    if consume_oauth_state is not None:
+        return False, None  # v16+ never issues legacy states, so one arriving here is forged
+    if not legacy or not legacy.get("token"):
+        return False, None
+    return True, _safe_redirect(legacy.get("redirect_to"))
 
 @frappe.whitelist(allow_guest=True)
 def custom(code: str, state: str | dict):
@@ -26,10 +70,13 @@ def custom(code: str, state: str | dict):
     - Maps groups from the claim of id token to ERPNext roles.
     """
 
-    state = json.loads(base64.b64decode(state).decode("utf-8"))
-
-    if not state or not state["token"]:
-        frappe.respond_as_web_page(_("Invalid request"), _("Token is missing."), http_status_code=417)
+    state_ok, redirect_to = _read_state(state)
+    if not state_ok:
+        frappe.respond_as_web_page(
+            _("Invalid request"),
+            _("This sign-in link has expired or was already used. Please sign in again."),
+            http_status_code=400,
+        )
         return
 
     request_path_components = frappe.request.path[1:].split("/")
@@ -102,7 +149,10 @@ def custom(code: str, state: str | dict):
         # To prevent accidental privilege issues, the Administrator must only
         # authenticate through the local ERPNext login mechanism where roles are
         # managed directly.
-        if username.lower() == "administrator":
+        # Compare normalised, and on the resolved account too: the database lookup above is
+        # case/collation-insensitive, so a look-alike username could otherwise resolve to the
+        # Administrator account (audit FRP-1).
+        if _normalise(username) == "administrator" or existing_user_name == "Administrator":
             frappe.logger().warning(f"Attempted OIDC login with administrator account: {username}")
             frappe.respond_as_web_page(
                 _("Not Allowed"),
@@ -210,7 +260,7 @@ def custom(code: str, state: str | dict):
 
     redirect_post_login(
         desk_user=frappe.local.response.get("message") == "Logged In",
-        redirect_to=state.get("redirect_to")
+        redirect_to=redirect_to,
     )
 
 def redirect_post_login(desk_user: bool, redirect_to: str):
